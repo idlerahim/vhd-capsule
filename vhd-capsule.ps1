@@ -179,7 +179,7 @@ function New-VHDItem {
     
     Write-Host "1. Fixed (Better Performance)"
     Write-Host "2. Dynamic (Saves Space)"
-    $typeChoice = Get-UserChoice "Select Type" 2
+    $typeChoice = Get-UserChoice "`nSelect Type" 2
     $type = if ($typeChoice -eq 1) { "fixed" } else { "expandable" }
     
     $formatChoice = Read-Host "Format as NTFS? (Y/N)"
@@ -221,25 +221,36 @@ function Invoke-VHDManager {
 
     $exitOps = $false
     while (-not $exitOps) {
+        $img = Get-DiskImage -ImagePath $Path -ErrorAction SilentlyContinue
+        $isMounted = $null
+        if ($img) { $isMounted = $img.Attached }
+
         Show-Header "Operations: $(Split-Path $Path -Leaf)"
         Write-Host "Selected: $Path"
         Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Gray
         Write-Host "-------------------"
-        Write-Host "1. Mount"
+        
+        if ($isMounted) { Write-Host "1. Dismount" } else { Write-Host "1. Mount" }
         Write-Host "2. Current State (Size, Files, Fragmentation)"
         Write-Host "3. Compact (Shrink File)"
         Write-Host "4. Defragment Inside"
         Write-Host "5. Clean Junk"
         Write-Host "6. Back to Main Menu"
         
-        $choice = Get-UserChoice "Select Option" 6
+        $choice = Get-UserChoice "`nSelect Option" 6
         
         switch ($choice) {
             1 { 
-                $drive = Mount-VHDNative -Path $Path
-                if ($drive) { 
-                    Write-Host "Mounted at $drive" -ForegroundColor Green
-                    Invoke-Item $drive
+                if ($isMounted) {
+                    Dismount-VHDNative -Path $Path
+                    Write-Host "Dismounted." -ForegroundColor Yellow
+                }
+                else {
+                    $drive = Mount-VHDNative -Path $Path
+                    if ($drive) { 
+                        Write-Host "Mounted at $drive" -ForegroundColor Green
+                        Invoke-Item $drive
+                    }
                 }
                 Read-Host "Press Enter"
             }
@@ -404,7 +415,7 @@ function Select-VHDFile {
         Write-Host "$($i+1). $($files[$i].Name) ($([Math]::Round($files[$i].Length/1MB, 0)) MB)"
     }
     
-    $sel = Get-UserChoice "Select Number" $files.Count
+    $sel = Get-UserChoice "`nSelect Number" $files.Count
     return $files[$sel - 1].FullName
 }
 
@@ -430,7 +441,7 @@ while ($true) {
     Write-Host "4. Launch VHDX in Capsule Mode"
     Write-Host "5. Exit"
     
-    $mainChoice = Get-UserChoice "Select Option" 5
+    $mainChoice = Get-UserChoice "`nSelect Option" 5
     
     switch ($mainChoice) {
         1 { New-VHDItem }
