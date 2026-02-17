@@ -1,193 +1,458 @@
-$VHDXFileName = "Super Street Fighter IV Arcade Edition.vhdx"
-$RelativeGamePath = "SSFIV.exe"
-$VHDXPath = Join-Path $PSScriptRoot $VHDXFileName
+<#
+.SYNOPSIS
+    Robust VHD/VHDX Manager and Capsule Launcher.
+.DESCRIPTION
+    Manages the lifecycle of Virtual Hard Disks (VHD/VHDX) and provides a specialized "Capsule Mode" 
+    for isolating applications/games with tracking of filesystem changes.
+    
+    Features:
+    - Create VHD/VHDX (Fixed/Dynamic)
+    - Browse and Select VHDs
+    - Operations: Mount, Compact, Defrag, Clean Junk
+    - Capsule Mode: Mount -> Snapshot -> Execute -> Diff -> Maintenance
+    
+.PARAMETER VHDPath
+    (Optional) Path to a VHD/VHDX file to pre-select or launch.
+.PARAMETER Mode
+    (Optional) Start directly in specific mode: 'Manager', 'Capsule'. Default is 'Menu'.
+.PARAMETER GamePath
+    (Optional) For Capsule Mode: The relative path to the executable inside the VHD.
+#>
+param(
+    [Parameter(Mandatory = $false)]
+    [string]$VHDPath,
 
-# 0. Safety Check & Cleanup
-if (-not (Test-Path $VHDXPath)) {
-    Write-Host "[ERROR] VHDX file not found at: $VHDXPath" -ForegroundColor Red
-    Read-Host "Press any key to exit"
-    exit
+    [Parameter(Mandatory = $false)]
+    [ValidateSet("Menu", "Manager", "Capsule")]
+    [string]$Mode = "Menu",
+
+    [Parameter(Mandatory = $false)]
+    [string]$GamePath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$InitialDir
+)
+
+# -------------------------------------------------------------------------
+# 0. INITIALIZATION & SAFETY
+# -------------------------------------------------------------------------
+
+if ($InitialDir -and (Test-Path $InitialDir)) {
+    Set-Location $InitialDir
 }
 
-# Attempt to clear any "stuck" mounts from previous failed runs
-$ExistingMount = Get-DiskImage -ImagePath $VHDXPath
-if ($ExistingMount.Attached) {
-    Write-Host "[INFO] VHDX is already attached. Attempting to cycle connection..." -ForegroundColor Yellow
-    Dismount-DiskImage -ImagePath $VHDXPath -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+# Formatting for consistency
+$Host.UI.RawUI.WindowTitle = "VHD Manager & Capsule Launcher"
+$ErrorActionPreference = "Stop"
+
+function Assert-Admin {
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        Write-Host "[INFO] Requesting Administrator privileges..." -ForegroundColor Yellow
+        $params = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+        if ($VHDPath) { $params += " -VHDPath `"$VHDPath`"" }
+        if ($Mode -ne "Menu") { $params += " -Mode $Mode" }
+        if ($GamePath) { $params += " -GamePath `"$GamePath`"" }
+        $params += " -InitialDir `"$($pwd.Path)`""
+        
+        Start-Process powershell.exe $params -Verb RunAs
+        exit
+    }
+}
+Assert-Admin
+
+# -------------------------------------------------------------------------
+# 1. HELPER FUNCTIONS
+# -------------------------------------------------------------------------
+
+function Show-Header {
+    param([string]$Title)
+    Clear-Host
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "   VHD MANAGER: $Title" -ForegroundColor White
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
 }
 
-# 1. Self-Elevation Block
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
-    exit
+function Get-UserChoice {
+    param([string]$Prompt, [int]$Max)
+    while ($true) {
+        $inputVal = Read-Host $Prompt
+        if ($inputVal -match "^\d+$" -and [int]$inputVal -ge 1 -and [int]$inputVal -le $Max) {
+            return [int]$inputVal
+        }
+        Write-Host "Invalid selection. Please enter a number between 1 and $Max." -ForegroundColor Red
+    }
 }
 
 function Get-VHDXPhysicalSize {
-    $file = Get-Item $VHDXPath
-    return [Math]::Round($file.Length / 1MB, 2)
-}
-
-Write-Host "--- Starting Game Launch Sequence ---" -ForegroundColor White
-Write-Host "VHDX Name: $VHDXFileName"
-Write-Host "Game Path: $RelativeGamePath"
-Write-Host "Current Physical Size: $(Get-VHDXPhysicalSize) MB`n"
-
-# STEP 1: VIRTUALIZATION
-Write-Host "[STEP 1/4] STATUS: MOUNTING VHDX [$VHDXFileName]..." -ForegroundColor Cyan
-try {
-    $DiskImage = Mount-DiskImage -ImagePath $VHDXPath -PassThru -ErrorAction Stop
-    Start-Sleep -Seconds 3
-    $Partition = $DiskImage | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter }
-    
-    if (-not $Partition.DriveLetter) {
-        throw "Disk mounted but no drive letter assigned."
+    param([string]$Path)
+    if (Test-Path $Path) {
+        $file = Get-Item $Path
+        return [Math]::Round($file.Length / 1MB, 2)
     }
-    
-    $Drive = "$($Partition.DriveLetter):"
-    Write-Host "                    COMPLETE: Mounted on $Drive" -ForegroundColor Green
+    return 0
 }
-catch {
-    Write-Host "`n[FATAL ERROR] Could not mount VHDX." -ForegroundColor Red
-    if ($_.Exception.HResult -eq -2147024864) { # 0x80070020
-        Write-Host "REASON: The file is locked by another process." -ForegroundColor Yellow
-        Write-Host "FIX: Check if the VHDX is already open in Disk Management, another script, or an Emulator." -ForegroundColor White
-    } else {
-        Write-Host "REASON: $($_.Exception.Message)" -ForegroundColor Yellow
+
+function Get-FreeDriveLetter {
+    $letters = 68..90 | ForEach-Object { [char]$_ + ":" } # D: to Z:
+    $used = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
+    foreach ($letter in $letters) {
+        if ($used -notcontains $letter[0]) { return $letter }
     }
-    Write-Host "`nScript cannot continue."
-    Read-Host "Press any key to exit"
-    exit
+    throw "No free drive letters available."
 }
 
-# STEP 2: PRE-FLIGHT SNAPSHOT
-Write-Host "[STEP 2/4] STATUS: TAKING BEFORE SNAPSHOT..." -ForegroundColor Cyan
-$Before = Get-ChildItem -Path $Drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
-Write-Host "                    COMPLETE: Baseline established." -ForegroundColor Green
-
-# STEP 3: EXECUTION & TRACKING
-Write-Host "[STEP 3/4] STATUS: LAUNCHING GAME [$RelativeGamePath]..." -ForegroundColor Cyan
-$FullGamePath = Join-Path $Drive $RelativeGamePath
-
-if (Test-Path $FullGamePath) {
-    $gameProcess = Start-Process -FilePath $FullGamePath -PassThru
+# Wrapper to handle DiskPart scripting
+function Invoke-DiskPartScript {
+    param([string]$ScriptContent)
+    $dpScript = Join-Path $env:TEMP "vhd_manager_script.txt"
+    $ScriptContent | Out-File -FilePath $dpScript -Encoding ASCII
     
-    # Wait for the process to exit
-    $gameProcess.WaitForExit()
+    try {
+        $output = diskpart /s $dpScript
+        return $output
+    }
+    finally {
+        if (Test-Path $dpScript) { Remove-Item $dpScript }
+    }
+}
+
+# Robust Mounting Logic
+function Mount-VHDNative {
+    param([string]$Path)
     
-    Write-Host "                    COMPLETE: Game process closed." -ForegroundColor Green
-    Write-Host "                    STATUS: Waiting 3s for file system to settle..." -ForegroundColor Gray
+    Write-Host "Mounting $Path..." -ForegroundColor Yellow
     
-    # The requested 3-second wait for file flushing
-    Start-Sleep -Seconds 3
-}
-else {
-    Write-Host "[ERROR] Could not find $RelativeGamePath on $Drive" -ForegroundColor Red
-    Read-Host "Press any key to continue to maintenance..."
-}
-
-# ANALYSIS
-Write-Host "`n[ANALYSIS] File System Changes:" -ForegroundColor Yellow
-$After = Get-ChildItem -Path $Drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
-$Diffs = Compare-Object -ReferenceObject $Before -DifferenceObject $After -Property FullName, LastWriteTime, Length -PassThru
-$Results = foreach ($Item in $Diffs) {
-    $RelativeName = $Item.FullName.Replace($Drive, "")
-    $Status = if ($Item.SideIndicator -eq "=>") { if ($Before.FullName -contains $Item.FullName) { "MODIFIED" } else { "ADDED" } } else { if ($After.FullName -notcontains $Item.FullName) { "DELETED" } else { $null } }
-    if ($Status) { [PSCustomObject]@{ Status = $Status; File = $RelativeName; Size = "$([Math]::Round($Item.Length / 1KB, 2)) KB"; Date = $Item.LastWriteTime.ToString("dd-MMM-yy HH:mm:ss") } }
-}
-if ($Results) { $Results | Sort-Object Status, Date | Format-Table -AutoSize } else { Write-Host "No changes detected." -ForegroundColor Gray }
-
-# STEP 4: MAINTENANCE & COMPACTION
-Write-Host "[STEP 4/4] STATUS: ENTERING MAINTENANCE MODE..." -ForegroundColor Cyan
-$ExitMenu = $false
-while (-not $ExitMenu) {
-    Write-Host "`n--- VHDX MANAGEMENT MENU ---" -ForegroundColor Magenta
-    Write-Host "1. Dismount and Exit (Press 1 or Enter)"
-    Write-Host "2. Current State (Size, Files, Fragmentation)"
-    Write-Host "3. Compact (Shrink VHDX File)"
-    Write-Host "4. Defragment Inside VHDX"
-    Write-Host "5. Clean Junk (.BIN & System Volume Info)"
-    $choice = Read-Host "`nSelect an option"
-
-    switch ($choice) {
-        {($_ -eq "1") -or ($_ -eq "")} { $ExitMenu = $true }
-        "2" {
-            $allFiles = Get-ChildItem -Path $Drive -Recurse
-            $fileCount = ($allFiles | Where-Object { -not $_.PSIsContainer }).Count
-            $usedSpace = (Get-Volume -DriveLetter $Partition.DriveLetter).SizeRemaining
-            Write-Host "`nInternal Files: $fileCount | Physical Size: $(Get-VHDXPhysicalSize) MB" -ForegroundColor Cyan
-            Optimize-Volume -DriveLetter $Partition.DriveLetter -Analyze -Verbose
+    # Try generic Mount-DiskImage
+    try {
+        $mount = Mount-DiskImage -ImagePath $Path -PassThru -ErrorAction Stop
+        
+        # Wait for volume
+        Start-Sleep -Seconds 2
+        
+        $volume = $mount | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
+        if ($volume) {
+            return "$($volume.DriveLetter):"
         }
-		"3" { 
-            $OldSize = Get-VHDXPhysicalSize
-            Write-Host "Dismounting for compaction..." -ForegroundColor Cyan
-            Dismount-DiskImage -ImagePath $VHDXPath
-            Start-Sleep -Seconds 2
+        
+        # If no letter assigned, try to assign one via diskpart
+        Write-Host "No drive letter found. Attempting to assign..." -ForegroundColor Yellow
+        $script = @"
+select vdisk file="$Path"
+attach vdisk
+select partition 1
+assign
+"@
+        Invoke-DiskPartScript -ScriptContent $script | Out-Null
+        
+        # Check again
+        $mount = Get-DiskImage -ImagePath $Path
+        $volume = $mount | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
+        if ($volume) { return "$($volume.DriveLetter):" }
+    }
+    catch {
+        Write-Host "Mount failed: $($_.Exception.Message)" -ForegroundColor Red
+    }
+    return $null
+}
 
-            # Create a temporary DiskPart script
-            $dpScript = Join-Path $env:TEMP "compact_vhd.txt"
-            # The closing tag below MUST stay at the far left margin
-            $scriptContent = @"
-select vdisk file="$VHDXPath"
+function Dismount-VHDNative {
+    param([string]$Path)
+    Write-Host "Dismounting $Path..." -ForegroundColor Yellow
+    Dismount-DiskImage -ImagePath $Path -ErrorAction SilentlyContinue | Out-Null
+}
+
+# -------------------------------------------------------------------------
+# 2. CORE LOGIC BLOCKS
+# -------------------------------------------------------------------------
+
+function New-VHDItem {
+    Show-Header "Create New VHD/VHDX"
+    
+    $name = Read-Host "Enter Filename (e.g. MyGames.vhdx)"
+    if ($name -notmatch "\.vhd(x)?$") { $name += ".vhdx" }
+    
+    $sizeGB = Read-Host "Enter Size in GB"
+    if ($sizeGB -notmatch "^\d+$") { $sizeGB = 10 }
+    $sizeMB = [int]$sizeGB * 1024
+    
+    Write-Host "1. Fixed (Better Performance)"
+    Write-Host "2. Dynamic (Saves Space)"
+    $typeChoice = Get-UserChoice "Select Type" 2
+    $type = if ($typeChoice -eq 1) { "fixed" } else { "expandable" }
+    
+    $formatChoice = Read-Host "Format as NTFS? (Y/N)"
+    $doFormat = ($formatChoice -eq "Y")
+    
+    $targetPath = Join-Path $pwd $name
+    Write-Host "Creating $targetPath ($sizeGB GB, $type)..." -ForegroundColor Yellow
+    
+    # Use DiskPart for broad compatibility
+    $script = @"
+create vdisk file="$targetPath" maximum=$sizeMB type=$type
+select vdisk file="$targetPath"
+attach vdisk
+create partition primary
+"@
+    if ($doFormat) {
+        $script += "`nformat fs=ntfs quick label=`"VHDCapsule`""
+    }
+    $script += "`nassign`ndetach vdisk"
+    
+    Invoke-DiskPartScript -ScriptContent $script | Out-Null
+    
+    if (Test-Path $targetPath) {
+        Write-Host "Successfully created: $targetPath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "Failed to create VHD." -ForegroundColor Red
+    }
+    Read-Host "Press Enter to continue"
+}
+
+function Invoke-VHDManager {
+    param([string]$Path)
+    
+    if (-not (Test-Path $Path)) {
+        Write-Host "Error: File not found: $Path" -ForegroundColor Red
+        return
+    }
+
+    $exitOps = $false
+    while (-not $exitOps) {
+        Show-Header "Operations: $(Split-Path $Path -Leaf)"
+        Write-Host "Selected: $Path"
+        Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Gray
+        Write-Host "-------------------"
+        Write-Host "1. Mount"
+        Write-Host "2. Current State (Size, Files, Fragmentation)"
+        Write-Host "3. Compact (Shrink File)"
+        Write-Host "4. Defragment Inside"
+        Write-Host "5. Clean Junk"
+        Write-Host "6. Back to Main Menu"
+        
+        $choice = Get-UserChoice "Select Option" 6
+        
+        switch ($choice) {
+            1 { 
+                $drive = Mount-VHDNative -Path $Path
+                if ($drive) { 
+                    Write-Host "Mounted at $drive" -ForegroundColor Green
+                    Invoke-Item $drive
+                }
+                Read-Host "Press Enter"
+            }
+            2 {
+                # Current State
+                $drive = Mount-VHDNative -Path $Path
+                if ($drive) {
+                    $stats = @{
+                        PhysicalSize = "$(Get-VHDXPhysicalSize $Path) MB"
+                        UsedSpace    = "$([Math]::Round(((Get-Volume -DriveLetter $drive[0]).SizeRemaining / 1GB), 2)) GB Free"
+                        FileCount    = (Get-ChildItem $drive -Recurse -File | Measure-Object).Count
+                    }
+                    $stats | Format-Table -AutoSize
+                    Optimize-Volume -DriveLetter $drive[0] -Analyze -Verbose
+                    Read-Host "Press Enter"
+                }
+            }
+            3 {
+                # Compact
+                Dismount-VHDNative -Path $Path
+                Write-Host "Compacting..." -ForegroundColor Yellow
+                $script = @"
+select vdisk file="$Path"
 attach vdisk readonly
 compact vdisk
 detach vdisk
 "@
-            $scriptContent | Out-File -FilePath $dpScript -Encoding ASCII
-
-            Write-Host "Compacting VHDX via DiskPart (this may take a minute)..." -ForegroundColor Yellow
-            diskpart /s $dpScript
-            Remove-Item $dpScript
-
-            $NewSize = Get-VHDXPhysicalSize
-            Write-Host "Reclaimed: $([Math]::Round($OldSize - $NewSize, 2)) MB" -ForegroundColor Green
-            
-            # Remount so the script can continue tracking or exit
-            $DiskImage = Mount-DiskImage -ImagePath $VHDXPath -PassThru
-            Start-Sleep -Seconds 2
-        }
-        "4" { Optimize-Volume -DriveLetter $Partition.DriveLetter -Defrag -Verbose }
-		"5" {
-            Write-Host "`n[EXEC] Analyzing junk files..." -ForegroundColor Cyan
-            $junkPaths = @("$Drive\`$RECYCLE.BIN", "$Drive\System Volume Information")
-            $totalFreedBytes = 0
-            $filesDeleted = 0
-            $foldersDeleted = 0
-            
-            foreach ($path in $junkPaths) {
-                if (Test-Path $path) {
-                    # Get all items including those in hidden SID subfolders
-                    $items = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-                    
-                    foreach ($item in $items) {
-                        if ($item.PSIsContainer) {
-                            $foldersDeleted++
-                        } else {
-                            $shortName = $item.FullName.Replace($Drive, '')
-                            Write-Host "Deleting: $shortName ($([Math]::Round($item.Length / 1KB, 2)) KB)" -ForegroundColor Gray
-                            $totalFreedBytes += $item.Length
-                            $filesDeleted++
-                        }
-                    }
-                    # Force removal of the root junk directories and their contents
-                    Remove-Item -Path $path -Recurse -Force -ErrorAction SilentlyContinue
-                    $foldersDeleted++ # Count the parent junk folder itself
+                Invoke-DiskPartScript -ScriptContent $script | Out-Null
+                Write-Host "Compaction Complete. New Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Green
+                Read-Host "Press Enter"
+            }
+            4 {
+                # Defrag
+                $drive = Mount-VHDNative -Path $Path
+                if ($drive) {
+                    Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose
+                    Read-Host "Press Enter"
                 }
             }
-            
-            if ($filesDeleted -eq 0 -and $foldersDeleted -eq 0) {
-                Write-Host "No junk files found. The Recycle Bin is already empty." -ForegroundColor Gray
-            } else {
-                Write-Host "`nCleanup Complete!" -ForegroundColor Green
-                Write-Host "Items Removed: $filesDeleted Files, $foldersDeleted Folders"
-                Write-Host "Total Freed  : $totalFreedBytes Bytes ($([Math]::Round($totalFreedBytes / 1MB, 4)) MB)" -ForegroundColor Yellow
+            5 {
+                # Clean Junk
+                $drive = Mount-VHDNative -Path $Path
+                if ($drive) {
+                    $junk = @("$drive\`$RECYCLE.BIN", "$drive\System Volume Information")
+                    foreach ($j in $junk) {
+                        if (Test-Path $j) {
+                            Remove-Item $j -Recurse -Force -ErrorAction SilentlyContinue
+                            Write-Host "Cleaned $j" -ForegroundColor Yellow
+                        }
+                    }
+                    Read-Host "Cleanup Done. Press Enter"
+                }
             }
+            6 { $exitOps = $true; Dismount-VHDNative -Path $Path }
         }
     }
 }
 
-# FINAL DISMOUNT
-Dismount-DiskImage -ImagePath $VHDXPath
-Write-Host "[STEP 4/4] COMPLETE: VHDX Disconnected." -ForegroundColor Green
-Write-Host "--- Sequence Complete ---"
-Read-Host "Press any key to exit"
+function Invoke-CapsuleMode {
+    param([string]$Path, [string]$RelPath)
+    
+    if (-not $Path) {
+        $Path = Read-Host "Drag and drop VHD file here"
+        $Path = $Path.Trim('"')
+    }
+    if (-not (Test-Path $Path)) {
+        Write-Host "File not found." -ForegroundColor Red; Start-Sleep 2; return
+    }
+
+    if (-not $RelPath) {
+        $RelPath = Read-Host "Enter Relative Game Path (e.g. GameFolder\Game.exe)"
+    }
+    
+    Show-Header "CAPSULE MODE: $(Split-Path $Path -Leaf)"
+    
+    # Step 1: Virtualization
+    Write-Host "[1/4] Mounting..." -ForegroundColor Cyan
+    $drive = Mount-VHDNative -Path $Path
+    if (-not $drive) { Write-Host "Failed to mount." -ForegroundColor Red; return }
+    
+    # Step 2: Snapshot
+    Write-Host "[2/4] Taking filesystem snapshot..." -ForegroundColor Cyan
+    $Before = Get-ChildItem -Path $drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
+    
+    # Step 3: Execution
+    $FullPath = Join-Path $drive $RelPath
+    if (Test-Path $FullPath) {
+        Write-Host "[3/4] Launching $RelPath..." -ForegroundColor Green
+        $proc = Start-Process -FilePath $FullPath -PassThru
+        $proc.WaitForExit()
+        Write-Host "Execution Finished." -ForegroundColor Yellow
+        Start-Sleep -Seconds 3 # Flush buffers
+    }
+    else {
+        Write-Host "Executable not found at $FullPath" -ForegroundColor Red
+        Read-Host "Press Enter to continue to Maintenance"
+    }
+    
+    # Analysis
+    Write-Host "Analyzing changes..." -ForegroundColor Cyan
+    $After = Get-ChildItem -Path $drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
+    $Diffs = Compare-Object -ReferenceObject $Before -DifferenceObject $After -Property FullName, LastWriteTime, Length -PassThru
+    
+    if ($Diffs) {
+        $Diffs | Format-Table -AutoSize
+    }
+    else {
+        Write-Host "No filesystem changes detected." -ForegroundColor Gray
+    }
+    
+    # Step 4: Maintenance
+    Write-Host "[4/4] Maintenance Menu" -ForegroundColor Cyan
+    
+    $exitMaint = $false
+    while (-not $exitMaint) {
+        Write-Host "`n1. Dismount and Exit"
+        Write-Host "2. Current State"
+        Write-Host "3. Compact"
+        Write-Host "4. Defrag"
+        Write-Host "5. Clean Junk"
+        
+        $c = Read-Host "Selection"
+        switch ($c) {
+            1 { $exitMaint = $true }
+            2 { 
+                Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" 
+            }
+            3 {
+                Dismount-VHDNative -Path $Path
+                $script = "select vdisk file=`"$Path`"`nattach vdisk readonly`ncompact vdisk`ndetach vdisk"
+                Invoke-DiskPartScript $script | Out-Null
+                Write-Host "Compacted." -ForegroundColor Green
+                $drive = Mount-VHDNative -Path $Path # Remount for continued maintenance if needed
+            }
+            4 { Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose }
+            5 { 
+                Remove-Item "$drive\`$RECYCLE.BIN" -Recurse -Force -ErrorAction SilentlyContinue 
+                Write-Host "Cleaned."
+            }
+        }
+    }
+    
+    Dismount-VHDNative -Path $Path
+    Write-Host "Capsule Closed." -ForegroundColor Green
+    Start-Sleep 2
+}
+
+# -------------------------------------------------------------------------
+# 3. FILE BROWSER
+# -------------------------------------------------------------------------
+
+function Select-VHDFile {
+    Write-Host "Scanning directory: $pwd" -ForegroundColor Gray
+    $files = Get-ChildItem -Path $pwd -Include *.vhd, *.vhdx -File
+    if (-not $files) {
+        Write-Host "No VHD/VHDX files found in current directory." -ForegroundColor Yellow
+        return $null
+    }
+    
+    Write-Host "Found VHDs:"
+    for ($i = 0; $i -lt $files.Count; $i++) {
+        Write-Host "$($i+1). $($files[$i].Name) ($([Math]::Round($files[$i].Length/1MB, 0)) MB)"
+    }
+    
+    $sel = Get-UserChoice "Select Number" $files.Count
+    return $files[$sel - 1].FullName
+}
+
+# -------------------------------------------------------------------------
+# 4. MAIN ENTRY POINT
+# -------------------------------------------------------------------------
+
+if ($Mode -eq "Capsule" -and $VHDPath) {
+    Invoke-CapsuleMode -Path $VHDPath -RelPath $GamePath
+    exit
+}
+elseif ($Mode -eq "Manager" -and $VHDPath) {
+    Invoke-VHDManager -Path $VHDPath
+    exit
+}
+
+# Interactive Menu Loop
+while ($true) {
+    Show-Header "Main Menu"
+    Write-Host "1. Create VHD (Initialize & Format)"
+    Write-Host "2. Browse VHD (Select from list)"
+    Write-Host "3. Manual Select VHD (Path input)"
+    Write-Host "4. Launch VHDX in Capsule Mode"
+    Write-Host "5. Exit"
+    
+    $mainChoice = Get-UserChoice "Select Option" 5
+    
+    switch ($mainChoice) {
+        1 { New-VHDItem }
+        2 { 
+            $p = Select-VHDFile
+            if ($p) { Invoke-VHDManager -Path $p }
+            else { Read-Host "Press Enter" }
+        }
+        3 {
+            $p = Read-Host "Enter full path to VHD/VHDX"
+            $p = $p.Trim('"')
+            if (Test-Path $p) { Invoke-VHDManager -Path $p }
+            else { Write-Host "File not found." -ForegroundColor Red; Read-Host "Press Enter" }
+        }
+        4 {
+            $p = Select-VHDFile
+            if (-not $p) {
+                $p = Read-Host "Enter full path to VHD/VHDX"
+                $p = $p.Trim('"')
+            }
+            if ($p -and (Test-Path $p)) { Invoke-CapsuleMode -Path $p -RelPath $null }
+        }
+        5 { exit }
+    }
+}
