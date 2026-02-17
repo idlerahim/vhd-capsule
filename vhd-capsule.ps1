@@ -175,7 +175,7 @@ function New-VHDItem {
     Write-Host "1. VHDX [Default]"
     Write-Host "2. VHD"
     Write-Host "0. Cancel"
-    $fmtChoice = Read-Host "Select Type"
+    $fmtChoice = Read-Host "`nSelect Type"
     if ($fmtChoice -eq "0") { return }
     $extension = if ($fmtChoice -eq "2") { ".vhd" } else { ".vhdx" }
     
@@ -183,7 +183,7 @@ function New-VHDItem {
     Show-Header "Create New VHD/VHDX: Step 2/7"
     Write-Host "Enter Filename (e.g. MyGames$extension)"
     Write-Host "0. Cancel"
-    $name = Read-Host "Filename"
+    $name = Read-Host "`nFilename"
     if ($name -eq "0") { return }
     
     if ([string]::IsNullOrWhiteSpace($name)) { return }
@@ -195,7 +195,7 @@ function New-VHDItem {
     Show-Header "Create New VHD/VHDX: Step 3/7"
     Write-Host "Enter Size in GB"
     Write-Host "0. Cancel"
-    $sizeGB = Read-Host "Size"
+    $sizeGB = Read-Host "`nSize"
     if ($sizeGB -eq "0") { return }
     
     if ($sizeGB -notmatch "^\d+$") { $sizeGB = 10 }
@@ -207,7 +207,7 @@ function New-VHDItem {
     Write-Host "1. Dynamic (Saves Space) [Default]"
     Write-Host "2. Fixed (Better Performance)"
     Write-Host "0. Cancel"
-    $typeChoice = Read-Host "Select (1/2)"
+    $typeChoice = Read-Host "`nSelect (1/2)"
     if ($typeChoice -eq "0") { return }
     $type = if ($typeChoice -eq "2") { "fixed" } else { "expandable" }
 
@@ -217,7 +217,7 @@ function New-VHDItem {
     Write-Host "1. GPT (GUID Partition Table) [Default]"
     Write-Host "2. MBR (Master Boot Record)"
     Write-Host "0. Cancel"
-    $partChoice = Read-Host "Select Style (1/2)"
+    $partChoice = Read-Host "`nSelect Style (1/2)"
     if ($partChoice -eq "0") { return }
     $partStyle = if ($partChoice -eq "2") { "mbr" } else { "gpt" }
 
@@ -227,7 +227,7 @@ function New-VHDItem {
     Write-Host "1. NTFS [Default]"
     Write-Host "2. FAT32"
     Write-Host "0. Cancel"
-    $fsChoice = Read-Host "Select File System (1/2)"
+    $fsChoice = Read-Host "`nSelect File System (1/2)"
     if ($fsChoice -eq "0") { return }
     $fs = if ($fsChoice -eq "2") { "fat32" } else { "ntfs" }
     
@@ -237,7 +237,7 @@ function New-VHDItem {
         Write-Host "1. No [Default]"
         Write-Host "2. Yes"
         Write-Host "0. Cancel"
-        $compChoice = Read-Host "Select (1/2)"
+        $compChoice = Read-Host "`nSelect (1/2)"
         if ($compChoice -eq "0") { return }
         if ($compChoice -eq "2") { $enableCompression = $true }
     }
@@ -265,7 +265,7 @@ function New-VHDItem {
         Write-Host "$($i+1). $($allocUnits[$i].L)"
     }
     Write-Host "0. Cancel"
-    $allocChoice = Read-Host "Select Allocation Unit (Default: 1)"
+    $allocChoice = Read-Host "`nSelect Allocation Unit (Default: 1)"
     if ($allocChoice -eq "0") { return }
     
     if ($allocChoice -notmatch "^\d+$" -or [int]$allocChoice -lt 1 -or [int]$allocChoice -gt $allocUnits.Count) { $allocChoice = 1 }
@@ -275,7 +275,7 @@ function New-VHDItem {
     Show-Header "Create New VHD/VHDX: Confirmation"
     Write-Host "Enter Volume Label (Default: `"New Volume`")"
     Write-Host "0. Cancel"
-    $label = Read-Host "Label"
+    $label = Read-Host "`nLabel"
     if ($label -eq "0") { return }
     if ([string]::IsNullOrWhiteSpace($label)) { $label = "New Volume" }
 
