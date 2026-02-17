@@ -393,7 +393,7 @@ function Invoke-CapsuleMode {
 
 function Select-VHDFile {
     Write-Host "Scanning directory: $pwd" -ForegroundColor Gray
-    $files = Get-ChildItem -Path $pwd -Include *.vhd, *.vhdx -File
+    $files = Get-ChildItem -Path $pwd -File | Where-Object { $_.Extension -match "\.vhd(x)?$" }
     if (-not $files) {
         Write-Host "No VHD/VHDX files found in current directory." -ForegroundColor Yellow
         return $null
