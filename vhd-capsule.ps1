@@ -168,47 +168,159 @@ function Dismount-VHDNative {
 # -------------------------------------------------------------------------
 
 function New-VHDItem {
-    Show-Header "Create New VHD/VHDX"
+    Show-Header "Create New VHD/VHDX: Step 1/7"
     
-    $name = Read-Host "Enter Filename (e.g. MyGames.vhdx)"
-    if ($name -notmatch "\.vhd(x)?$") { $name += ".vhdx" }
+    # 0. Format Selection
+    Write-Host "Virtual Hard Disk Type:"
+    Write-Host "1. VHDX [Default]"
+    Write-Host "2. VHD"
+    Write-Host "0. Cancel"
+    $fmtChoice = Read-Host "Select Type"
+    if ($fmtChoice -eq "0") { return }
+    $extension = if ($fmtChoice -eq "2") { ".vhd" } else { ".vhdx" }
     
-    $sizeGB = Read-Host "Enter Size in GB"
+    # 1. Filename
+    Show-Header "Create New VHD/VHDX: Step 2/7"
+    Write-Host "Enter Filename (e.g. MyGames$extension)"
+    Write-Host "0. Cancel"
+    $name = Read-Host "Filename"
+    if ($name -eq "0") { return }
+    
+    if ([string]::IsNullOrWhiteSpace($name)) { return }
+    if ($name -match "\.(vhd|vhdx)$") { $name = $name -replace "\.(vhd|vhdx)$", "" }
+    $name += $extension
+    $targetPath = Join-Path $pwd $name
+
+    # 2. Size
+    Show-Header "Create New VHD/VHDX: Step 3/7"
+    Write-Host "Enter Size in GB"
+    Write-Host "0. Cancel"
+    $sizeGB = Read-Host "Size"
+    if ($sizeGB -eq "0") { return }
+    
     if ($sizeGB -notmatch "^\d+$") { $sizeGB = 10 }
     $sizeMB = [int]$sizeGB * 1024
+
+    # 3. Type
+    Show-Header "Create New VHD/VHDX: Step 4/7"
+    Write-Host "Virtual Disk Type:"
+    Write-Host "1. Dynamic (Saves Space) [Default]"
+    Write-Host "2. Fixed (Better Performance)"
+    Write-Host "0. Cancel"
+    $typeChoice = Read-Host "Select (1/2)"
+    if ($typeChoice -eq "0") { return }
+    $type = if ($typeChoice -eq "2") { "fixed" } else { "expandable" }
+
+    # 4. Partition Style
+    Show-Header "Create New VHD/VHDX: Step 5/7"
+    Write-Host "Initialize Disk as:"
+    Write-Host "1. GPT (GUID Partition Table) [Default]"
+    Write-Host "2. MBR (Master Boot Record)"
+    Write-Host "0. Cancel"
+    $partChoice = Read-Host "Select Style (1/2)"
+    if ($partChoice -eq "0") { return }
+    $partStyle = if ($partChoice -eq "2") { "mbr" } else { "gpt" }
+
+    # 5. File System
+    Show-Header "Create New VHD/VHDX: Step 6/7"
+    Write-Host "Format Disk as:"
+    Write-Host "1. NTFS [Default]"
+    Write-Host "2. FAT32"
+    Write-Host "0. Cancel"
+    $fsChoice = Read-Host "Select File System (1/2)"
+    if ($fsChoice -eq "0") { return }
+    $fs = if ($fsChoice -eq "2") { "fat32" } else { "ntfs" }
     
-    Write-Host "1. Fixed (Better Performance)"
-    Write-Host "2. Dynamic (Saves Space)"
-    $typeChoice = Get-UserChoice "`nSelect Type" 2
-    $type = if ($typeChoice -eq 1) { "fixed" } else { "expandable" }
+    $enableCompression = $false
+    if ($fs -eq "ntfs") {
+        Write-Host "`nEnable file and folder compression:"
+        Write-Host "1. No [Default]"
+        Write-Host "2. Yes"
+        Write-Host "0. Cancel"
+        $compChoice = Read-Host "Select (1/2)"
+        if ($compChoice -eq "0") { return }
+        if ($compChoice -eq "2") { $enableCompression = $true }
+    }
+
+    # 6. Allocation Unit
+    Show-Header "Create New VHD/VHDX: Step 7/7"
+    Write-Host "Allocation Unit Size:"
+    $allocUnits = @(
+        @{ L = "Default 4K (General Windows usage)"; V = "default" },
+        @{ L = "512 B (Legacy systems)"; V = "512" },
+        @{ L = "1 KB (Embedded or special workloads)"; V = "1024" },
+        @{ L = "2 KB (Niche workloads)"; V = "2048" },
+        @{ L = "4 KB (OS drives, games, mixed data, VHDX)"; V = "4096" },
+        @{ L = "8 KB (Moderate archive workloads)"; V = "8192" },
+        @{ L = "16 KB (ISOs, VHDX storage, video archives)"; V = "16K" },
+        @{ L = "32 KB (Media servers, large backups)"; V = "32K" },
+        @{ L = "64 KB (Large databases, VM storage)"; V = "64K" },
+        @{ L = "128 KB (Enterprise workloads)"; V = "128K" },
+        @{ L = "256 KB (Specialized storage appliances)"; V = "256K" },
+        @{ L = "512 KB (Large streaming storage)"; V = "512K" },
+        @{ L = "1 MB (Backup volumes)"; V = "1024K" },
+        @{ L = "2 MB (High performance storage arrays)"; V = "2048K" }
+    )
+    for ($i = 0; $i -lt $allocUnits.Count; $i++) {
+        Write-Host "$($i+1). $($allocUnits[$i].L)"
+    }
+    Write-Host "0. Cancel"
+    $allocChoice = Read-Host "Select Allocation Unit (Default: 1)"
+    if ($allocChoice -eq "0") { return }
     
-    $formatChoice = Read-Host "Format as NTFS? (Y/N)"
-    $doFormat = ($formatChoice -eq "Y")
+    if ($allocChoice -notmatch "^\d+$" -or [int]$allocChoice -lt 1 -or [int]$allocChoice -gt $allocUnits.Count) { $allocChoice = 1 }
+    $allocUnit = $allocUnits[[int]$allocChoice - 1].V
+
+    # 7. Volume Label & Confirmation
+    Show-Header "Create New VHD/VHDX: Confirmation"
+    Write-Host "Enter Volume Label (Default: `"New Volume`")"
+    Write-Host "0. Cancel"
+    $label = Read-Host "Label"
+    if ($label -eq "0") { return }
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = "New Volume" }
+
+    # Summary
+    Write-Host "`nReady to create VHD:" -ForegroundColor Cyan
+    Write-Host "Path      : $targetPath"
+    Write-Host "Size      : $sizeGB GB"
+    Write-Host "Type      : $type"
+    Write-Host "Style     : $partStyle"
+    Write-Host "Format    : $fs (Unit: $allocUnit)"
+    Write-Host "Compress  : $enableCompression"
+    Write-Host "Label     : $label"
     
-    $targetPath = Join-Path $pwd $name
-    Write-Host "Creating $targetPath ($sizeGB GB, $type)..." -ForegroundColor Yellow
+    $confirm = Read-Host "`nPress Enter to Create or '0' to Cancel"
+    if ($confirm -eq "0") { return }
+
+    # Execute
+    Write-Host "`nCreating..." -ForegroundColor Yellow
     
-    # Use DiskPart for broad compatibility
     $script = @"
 create vdisk file="$targetPath" maximum=$sizeMB type=$type
 select vdisk file="$targetPath"
 attach vdisk
+convert $partStyle
 create partition primary
 "@
-    if ($doFormat) {
-        $script += "`nformat fs=ntfs quick label=`"VHDCapsule`""
-    }
+    
+    # Build format command
+    $fmtCmd = "format fs=$fs label=`"$label`" quick"
+    if ($allocUnit -ne "default") { $fmtCmd += " unit=$allocUnit" }
+    if ($enableCompression) { $fmtCmd += " compress" }
+    
+    $script += "`n$fmtCmd"
     $script += "`nassign`ndetach vdisk"
     
     Invoke-DiskPartScript -ScriptContent $script | Out-Null
     
+    Show-Header "Create New VHD/VHDX: Complete"
     if (Test-Path $targetPath) {
         Write-Host "Successfully created: $targetPath" -ForegroundColor Green
     }
     else {
         Write-Host "Failed to create VHD." -ForegroundColor Red
     }
-    Read-Host "Press Enter to continue"
+    Read-Host "Press Enter to return to menu"
 }
 
 function Invoke-VHDManager {
