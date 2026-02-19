@@ -3,7 +3,7 @@
     Robust VHD/VHDX Manager and Capsule Launcher.
 .DESCRIPTION
     Manages the lifecycle of Virtual Hard Disks (VHD/VHDX) and provides a specialized "Capsule Mode" 
-    for isolating applications/games with tracking of filesystem changes.
+    for isolating applications with tracking of filesystem changes.
     
     Features:
     - Create VHD/VHDX (Fixed/Dynamic)
@@ -15,7 +15,7 @@
     (Optional) Path to a VHD/VHDX file to pre-select or launch.
 .PARAMETER Mode
     (Optional) Start directly in specific mode: 'Manager', 'Capsule'. Default is 'Menu'.
-.PARAMETER GamePath
+.PARAMETER AppPath
     (Optional) For Capsule Mode: The relative path to the executable inside the VHD.
 #>
 param(
@@ -27,10 +27,19 @@ param(
     [string]$Mode = "Menu",
 
     [Parameter(Mandatory = $false)]
-    [string]$GamePath,
+    [string]$AppPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$InitialDir
+    [string]$InitialDir,
+
+    [Parameter(Mandatory = $false)]
+    [string]$SourceFolder,
+
+    [Parameter(Mandatory = $false)]
+    [string]$DestinationPath,
+
+    [Parameter(Mandatory = $false)]
+    [string]$SizeGB
 )
 
 # -------------------------------------------------------------------------
@@ -52,7 +61,10 @@ function Assert-Admin {
         $params = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
         if ($VHDPath) { $params += " -VHDPath `"$VHDPath`"" }
         if ($Mode -ne "Menu") { $params += " -Mode $Mode" }
-        if ($GamePath) { $params += " -GamePath `"$GamePath`"" }
+        if ($AppPath) { $params += " -AppPath `"$AppPath`"" }
+        if ($SourceFolder) { $params += " -SourceFolder `"$SourceFolder`"" }
+        if ($DestinationPath) { $params += " -DestinationPath `"$DestinationPath`"" }
+        if ($SizeGB) { $params += " -SizeGB $SizeGB" }
         $params += " -InitialDir `"$($pwd.Path)`""
         
         Start-Process powershell.exe $params -Verb RunAs
@@ -69,19 +81,36 @@ function Show-Header {
     param([string]$Title)
     Clear-Host
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "   VHD MANAGER: $Title" -ForegroundColor White
+    Write-Host "   VHD CAPSULE: $Title" -ForegroundColor White
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Get-UserChoice {
-    param([string]$Prompt, [int]$Max)
+    param([string]$Prompt, [int]$Max, [scriptblock]$UIBlock, [int]$Default = 0)
+    
+    # Initial Draw
+    if ($UIBlock) { & $UIBlock }
+
     while ($true) {
         $inputVal = Read-Host $Prompt
-        if ($inputVal -match "^\d+$" -and [int]$inputVal -ge 1 -and [int]$inputVal -le $Max) {
+        
+        if ([string]::IsNullOrWhiteSpace($inputVal) -and $Default -gt 0) {
+            return $Default
+        }
+
+        if ($inputVal -match "^\d+$" -and [int]$inputVal -ge 0 -and [int]$inputVal -le $Max) {
             return [int]$inputVal
         }
-        Write-Host "Invalid selection. Please enter a number between 1 and $Max." -ForegroundColor Red
+        
+        # Invalid Input: Refresh
+        if ($UIBlock) {
+            & $UIBlock
+            Write-Host "Invalid selection. Please enter a number between 0 and $Max." -ForegroundColor Red
+        }
+        else {
+            Write-Host "Invalid selection." -ForegroundColor Red
+        }
     }
 }
 
@@ -181,7 +210,7 @@ function New-VHDItem {
     
     # 1. Filename
     Show-Header "Create New VHD/VHDX: Step 2/7"
-    Write-Host "Enter Filename (e.g. MyGames$extension)"
+    Write-Host "Enter Filename (e.g. MyApp$extension)"
     Write-Host "`n0. Cancel"
     $name = Read-Host "`nFilename"
     if ($name -eq "0") { return }
@@ -233,7 +262,8 @@ function New-VHDItem {
     
     $enableCompression = $false
     if ($fs -eq "ntfs") {
-        Write-Host "`nEnable file and folder compression:"
+        Show-Header "Create New VHD/VHDX: Step 6/7 (Compression)"
+        Write-Host "Enable file and folder compression:"
         Write-Host "1. No [Default]"
         Write-Host "2. Yes"
         Write-Host "`n0. Cancel"
@@ -250,7 +280,7 @@ function New-VHDItem {
         @{ L = "512 B (Legacy systems)"; V = "512" },
         @{ L = "1 KB (Embedded or special workloads)"; V = "1024" },
         @{ L = "2 KB (Niche workloads)"; V = "2048" },
-        @{ L = "4 KB (OS drives, games, mixed data, VHDX)"; V = "4096" },
+        @{ L = "4 KB (OS drives, apps, mixed data, VHDX)"; V = "4096" },
         @{ L = "8 KB (Moderate archive workloads)"; V = "8192" },
         @{ L = "16 KB (ISOs, VHDX storage, video archives)"; V = "16K" },
         @{ L = "32 KB (Media servers, large backups)"; V = "32K" },
@@ -323,6 +353,269 @@ create partition primary
     Read-Host "Press Enter to return to menu"
 }
 
+function New-VHDCapsuleFromFolder {
+    param(
+        [string]$InputSource,
+        [string]$InputDest,
+        [string]$InputSize
+    )
+
+    Show-Header "Create VHD Capsule from Folder: Step 1/4"
+    
+    # 1. Source Selection
+    if (-not [string]::IsNullOrWhiteSpace($InputSource)) {
+        $sourcePath = $InputSource
+    }
+    else {
+        $sourcePath = Read-Host "Enter Source Folder Path (e.g. C:\Apps\MyApp)"
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) { return }
+    }
+    
+    $sourcePath = $sourcePath.Trim('"').TrimEnd('\')
+    if (-not (Test-Path $sourcePath -PathType Container)) {
+        Write-Host "Invalid folder path: $sourcePath" -ForegroundColor Red
+        if ($InputSource) { Read-Host "Press Enter to Exit"; exit }
+        Read-Host "Press Enter"
+        return
+    }
+    $sourceName = Split-Path $sourcePath -Leaf
+
+    # 2. Destination Selection
+    Show-Header "Create VHD Capsule from Folder: Step 2/4"
+    $defaultDest = Split-Path $sourcePath -Parent
+    
+    if (-not [string]::IsNullOrWhiteSpace($InputDest)) {
+        $destDir = $InputDest
+    }
+    else {
+        Write-Host "Source: $sourcePath"
+        Write-Host "Enter Destination Directory for VHDX"
+        Write-Host "Default: $defaultDest" -ForegroundColor Gray
+        
+        if (-not [string]::IsNullOrWhiteSpace($InputSource)) {
+            $destDir = $defaultDest
+            Write-Host "Destination: $destDir (Default)"
+        }
+        else {
+            $destDir = Read-Host "Destination Path"
+        }
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($destDir)) { $destDir = $defaultDest }
+    $destDir = $destDir.Trim('"')
+    if (-not (Test-Path $destDir)) {
+        Write-Host "Invalid destination path." -ForegroundColor Red
+        if ($InputDest) { Read-Host "Press Enter to Exit"; exit }
+        Read-Host "Press Enter"
+        return
+    }
+
+    # 3. Size Calculation
+    Show-Header "Create VHD Capsule from Folder: Step 3/4"
+    Write-Host "Analyzing source folder..." -ForegroundColor Yellow
+    $stats = Get-ChildItem -Path $sourcePath -Recurse -Force | Measure-Object -Property Length -Sum
+    $sourceSizeGB = [Math]::Round($stats.Sum / 1GB, 2)
+    $minSizeGB = [Math]::Ceiling($sourceSizeGB + 2)
+    $defaultSizeGB = [Math]::Ceiling($sourceSizeGB + 5)
+    
+    Write-Host "Source Size      : $sourceSizeGB GB"
+    Write-Host "Minimum Required : $minSizeGB GB (Source + 2GB)"
+    
+    if (-not [string]::IsNullOrWhiteSpace($InputSize)) {
+        $sizeGB = $InputSize
+    }
+    else {
+        if (-not [string]::IsNullOrWhiteSpace($InputSource)) {
+            $sizeGB = $defaultSizeGB
+            Write-Host "Size: $sizeGB GB (Default)"
+        }
+        else {
+            $sizeGB = Read-Host "Enter VHDX Size in GB (Default: $defaultSizeGB)"
+        }
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($sizeGB)) { $sizeGB = $defaultSizeGB }
+    
+    # Validate Size
+    if ($sizeGB -notmatch "^\d+$") { $sizeGB = $defaultSizeGB }
+    if ([int]$sizeGB -lt $minSizeGB) {
+        Write-Host "Size too small. Setting to minimum: $minSizeGB GB" -ForegroundColor Yellow
+        $sizeGB = $minSizeGB
+    }
+    $sizeMB = [int]$sizeGB * 1024
+
+    # 4. Configuration & Confirmation
+    $config = @{
+        Extension = ".vhdx" # Default
+        Type      = "expandable" # Dynamic
+        PartStyle = "gpt"
+        Fs        = "ntfs"
+        AllocUnit = "4096"
+        Label     = $sourceName
+        Compress  = $false
+    }
+    
+    # Loop needs to be handled carefully with UserChoice
+    while ($true) {
+        $targetName = "$sourceName$($config.Extension)"
+        $targetPath = Join-Path $destDir $targetName
+        
+        $ui = {
+            Show-Header "Review VHD Capsule Configuration"
+            Write-Host "Source      : $sourcePath"
+            Write-Host "Target      : $targetPath"
+            Write-Host "Size        : $sizeGB GB"
+            Write-Host "Type        : $($config.Type)"
+            Write-Host "Style       : $($config.PartStyle)"
+            Write-Host "Format      : $($config.Fs) (Unit: $($config.AllocUnit))"
+            Write-Host "Compression : $($config.Compress)"
+            Write-Host "Label       : $($config.Label)"
+            Write-Host "--------------------------------"
+            Write-Host "1. Proceed"
+            Write-Host "2. Modify Settings"
+            Write-Host "3. Cancel"
+        }
+        
+        # We need to pass variables into the scriptblock scope if they aren't global. 
+        # PowerShell closures capture variables, so this should work fine locally.
+        
+        $choice = Get-UserChoice -Prompt "`nSelect Option (Default: 1)" -Max 3 -UIBlock $ui -Default 1
+        
+        if ($choice -eq 3) { return }
+        if ($choice -eq 1) { break }
+        
+        # Modify Logic
+        if ($choice -eq 2) {
+            Show-Header "Modify Settings"
+            
+            # Format
+            Write-Host "1. VHDX [Default], 2. VHD"
+            if ((Read-Host "Select") -eq "2") { $config.Extension = ".vhd" } else { $config.Extension = ".vhdx" }
+            
+            # Type
+            Write-Host "1. Dynamic [Default], 2. Fixed"
+            if ((Read-Host "Select") -eq "2") { $config.Type = "fixed" } else { $config.Type = "expandable" }
+            
+            # Partition
+            Write-Host "1. GPT [Default], 2. MBR"
+            if ((Read-Host "Select") -eq "2") { $config.PartStyle = "mbr" } else { $config.PartStyle = "gpt" }
+            
+            # FS
+            Write-Host "1. NTFS [Default], 2. FAT32"
+            if ((Read-Host "Select") -eq "2") { 
+                $config.Fs = "fat32"; $config.Compress = $false 
+            }
+            else { 
+                $config.Fs = "ntfs"
+                Write-Host "Enable Compression? 1. No [Default], 2. Yes"
+                if ((Read-Host "Select") -eq "2") { $config.Compress = $true } else { $config.Compress = $false }
+            }
+            
+            # Label
+            $lbl = Read-Host "Volume Label (Default: $($config.Label))"
+            if (-not [string]::IsNullOrWhiteSpace($lbl)) { $config.Label = $lbl }
+        }
+    }
+
+    # 5. Execution
+    Show-Header "Creating Capsule..."
+    Write-Host "Creating VHD..." -ForegroundColor Yellow
+    
+    $script = @"
+create vdisk file="$targetPath" maximum=$sizeMB type=$($config.Type)
+select vdisk file="$targetPath"
+attach vdisk
+convert $($config.PartStyle)
+create partition primary
+format fs=$($config.Fs) label="$($config.Label)" quick
+"@
+    # Add compression if needed (separate because format command is partially built)
+    # Actually simplest is to just append compress if needed, but 'format' is one line.
+    
+    # Rebuild script safely
+    $fmtCmd = "format fs=$($config.Fs) label=`"$($config.Label)`" quick"
+    if ($config.AllocUnit -ne "default") { $fmtCmd += " unit=$($config.AllocUnit)" }
+    if ($config.Compress) { $fmtCmd += " compress" }
+
+    $script = @"
+create vdisk file="$targetPath" maximum=$sizeMB type=$($config.Type)
+select vdisk file="$targetPath"
+attach vdisk
+convert $($config.PartStyle)
+create partition primary
+$fmtCmd
+assign
+detach vdisk
+"@
+    
+    Invoke-DiskPartScript -ScriptContent $script | Out-Null
+    
+    if (-not (Test-Path $targetPath)) {
+        Write-Host "Failed to create VHD." -ForegroundColor Red; Read-Host "Press Enter"; return
+    }
+
+    # 6. Copying
+    Write-Host "Mounting for data transfer..." -ForegroundColor Yellow
+    # Mounting can be tricky if quick removal/re-add happens. Wait a bit.
+    Start-Sleep 2
+    $drive = Mount-VHDNative -Path $targetPath
+    if (-not $drive) { Write-Host "Mount failed." -ForegroundColor Red; return }
+    try {
+        Write-Host "Copying files from source (Robocopy)..." -ForegroundColor Cyan
+        Write-Host "Source: $sourcePath" 
+        Write-Host "Target: $drive"
+        
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        
+        # Robocopy Argument Handling
+        # Robocopy requires explicit quotes around paths with spaces when valid via Start-Process ArgumentList in PS 5.1
+        $srcArg = "`"$sourcePath`""
+        $dstArg = "`"$drive`""
+        
+        $argsList = @($srcArg, $dstArg, "/E", "/COPY:DAT", "/J", "/MT:8", "/R:3", "/W:1", "/NFL", "/NDL", "/XJD", "/XJF")
+        # Added /XJD /XJF to exclude junction points which can cause loops or access issues
+        
+        $p = Start-Process -FilePath "robocopy.exe" -ArgumentList $argsList -PassThru -NoNewWindow -Wait
+        
+        $sw.Stop()
+        
+        # 7. Final Report
+        Write-Host "`nAnalysis & Verification..." -ForegroundColor Yellow
+        # Since we are mounted, we can measure destiny
+        # Use SilentlyContinue to ignore 'System Volume Information' access denied errors
+        $destStats = Get-ChildItem -Path $drive -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+        $destSizeGB = 0; if ($destStats.Sum) { $destSizeGB = [Math]::Round($destStats.Sum / 1GB, 4) }
+        $destCount = (Get-ChildItem -Path $drive -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+        $sourceCount = (Get-ChildItem -Path $sourcePath -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+        
+        Dismount-VHDNative -Path $targetPath
+        
+        Show-Header "Capsule Creation Complete"
+        Write-Host "Source" -ForegroundColor Cyan
+        Write-Host "  Path   : $sourcePath"
+        Write-Host "  Size   : $sourceSizeGB GB"
+        Write-Host "  Items  : $sourceCount"
+        
+        Write-Host "`nVHD Capsule" -ForegroundColor Cyan
+        Write-Host "  Path   : $targetPath"
+        Write-Host "  Size   : $destSizeGB GB (Content Total)"
+        Write-Host "  Items  : $destCount"
+        Write-Host "  Time   : $($sw.Elapsed.ToString('hh\:mm\:ss'))"
+        
+        if ($p.ExitCode -ge 8) {
+            Write-Host "`nWarning: Robocopy reported errors (Exit Code $($p.ExitCode))" -ForegroundColor Red
+        }
+    }
+    catch {
+        Write-Host "`n[ERROR] An error occurred during copy/verification:" -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        # Attempt emergency dismount
+        Dismount-VHDNative -Path $targetPath
+    }
+    
+    Read-Host "`nPress Enter to return to menu"
+}
+
 function Invoke-VHDManager {
     param([string]$Path)
     
@@ -337,22 +630,31 @@ function Invoke-VHDManager {
         $isMounted = $null
         if ($img) { $isMounted = $img.Attached }
 
-        Show-Header "Operations: $(Split-Path $Path -Leaf)"
-        Write-Host "Selected: $Path"
-        Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Gray
-        Write-Host "-------------------"
+        $ui = {
+            Show-Header "Operations: $(Split-Path $Path -Leaf)"
+            Write-Host "Selected: $Path"
+            Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Gray
+            Write-Host "-------------------"
+            
+            Write-Host "1. Launch in Capsule Mode"
+            
+            if ($isMounted) { Write-Host "2. Dismount" } else { Write-Host "2. Mount" }
+            Write-Host "3. Current State (Size, Files, Fragmentation)"
+            Write-Host "4. Compact (Shrink File)"
+            Write-Host "5. Defragment Inside"
+            Write-Host "6. Clean Junk"
+            Write-Host "`n0. Go back to main menu"
+        }
         
-        if ($isMounted) { Write-Host "1. Dismount" } else { Write-Host "1. Mount" }
-        Write-Host "2. Current State (Size, Files, Fragmentation)"
-        Write-Host "3. Compact (Shrink File)"
-        Write-Host "4. Defragment Inside"
-        Write-Host "5. Clean Junk"
-        Write-Host "6. Back to Main Menu"
-        
-        $choice = Get-UserChoice "`nSelect Option" 6
+        $choice = Get-UserChoice -Prompt "`nSelect Option (Default: 1)" -Max 6 -UIBlock $ui -Default 1
         
         switch ($choice) {
-            1 { 
+            1 {
+                # Capsule Mode
+                $exitOps = $true
+                Invoke-CapsuleMode -Path $Path -RelPath $null
+            }
+            2 { 
                 if ($isMounted) {
                     Dismount-VHDNative -Path $Path
                     Write-Host "Dismounted." -ForegroundColor Yellow
@@ -366,7 +668,7 @@ function Invoke-VHDManager {
                 }
                 Read-Host "Press Enter"
             }
-            2 {
+            3 {
                 # Current State
                 $drive = Mount-VHDNative -Path $Path
                 if ($drive) {
@@ -380,7 +682,7 @@ function Invoke-VHDManager {
                     Read-Host "Press Enter"
                 }
             }
-            3 {
+            4 {
                 # Compact
                 Dismount-VHDNative -Path $Path
                 Write-Host "Compacting..." -ForegroundColor Yellow
@@ -394,7 +696,7 @@ detach vdisk
                 Write-Host "Compaction Complete. New Size: $(Get-VHDXPhysicalSize $Path) MB" -ForegroundColor Green
                 Read-Host "Press Enter"
             }
-            4 {
+            5 {
                 # Defrag
                 $drive = Mount-VHDNative -Path $Path
                 if ($drive) {
@@ -402,7 +704,7 @@ detach vdisk
                     Read-Host "Press Enter"
                 }
             }
-            5 {
+            6 {
                 # Clean Junk
                 $drive = Mount-VHDNative -Path $Path
                 if ($drive) {
@@ -416,7 +718,7 @@ detach vdisk
                     Read-Host "Cleanup Done. Press Enter"
                 }
             }
-            6 { $exitOps = $true; Dismount-VHDNative -Path $Path }
+            0 { $exitOps = $true; Dismount-VHDNative -Path $Path }
         }
     }
 }
@@ -432,16 +734,32 @@ function Invoke-CapsuleMode {
         Write-Host "File not found." -ForegroundColor Red; Start-Sleep 2; return
     }
 
-    if (-not $RelPath) {
-        $RelPath = Read-Host "Enter Relative Game Path (e.g. GameFolder\Game.exe)"
-    }
-    
     Show-Header "CAPSULE MODE: $(Split-Path $Path -Leaf)"
     
     # Step 1: Virtualization
     Write-Host "[1/4] Mounting..." -ForegroundColor Cyan
     $drive = Mount-VHDNative -Path $Path
     if (-not $drive) { Write-Host "Failed to mount." -ForegroundColor Red; return }
+    
+    if (-not $RelPath) {
+        $defaultLnk = "launch_app.lnk"
+        $isDefaultFound = Test-Path (Join-Path $drive $defaultLnk)
+        $defaultMsg = "Enter Relative Path"
+        if ($isDefaultFound) { $defaultMsg += " (Default: $defaultLnk)" }
+        
+        $inputPath = Read-Host $defaultMsg
+        
+        if ([string]::IsNullOrWhiteSpace($inputPath)) {
+            if ($isDefaultFound) { $RelPath = $defaultLnk }
+            else { 
+                Write-Host "No path provided." -ForegroundColor Red; 
+                Dismount-VHDNative -Path $Path; return 
+            }
+        }
+        else {
+            $RelPath = $inputPath.Trim('"')
+        }
+    }
     
     # Step 2: Snapshot
     Write-Host "[2/4] Taking filesystem snapshot..." -ForegroundColor Cyan
@@ -478,27 +796,27 @@ function Invoke-CapsuleMode {
     
     $exitMaint = $false
     while (-not $exitMaint) {
-        Write-Host "`n1. Dismount and Exit"
-        Write-Host "2. Current State"
-        Write-Host "3. Compact"
-        Write-Host "4. Defrag"
-        Write-Host "5. Clean Junk"
-        
-        $c = Read-Host "Selection"
+        Write-Host "`n1. Current State"
+        Write-Host "2. Compact"
+        Write-Host "3. Defrag"
+        Write-Host "4. Clean Junk"
+        Write-Host "`n0. Go back to main menu"
+    
+        $c = Get-UserChoice -Prompt "`nSelection" -Max 4 -UIBlock $null
         switch ($c) {
-            1 { $exitMaint = $true }
-            2 { 
+            0 { $exitMaint = $true }
+            1 { 
                 Write-Host "Size: $(Get-VHDXPhysicalSize $Path) MB" 
             }
-            3 {
+            2 {
                 Dismount-VHDNative -Path $Path
                 $script = "select vdisk file=`"$Path`"`nattach vdisk readonly`ncompact vdisk`ndetach vdisk"
                 Invoke-DiskPartScript $script | Out-Null
                 Write-Host "Compacted." -ForegroundColor Green
                 $drive = Mount-VHDNative -Path $Path # Remount for continued maintenance if needed
             }
-            4 { Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose }
-            5 { 
+            3 { Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose }
+            4 { 
                 Remove-Item "$drive\`$RECYCLE.BIN" -Recurse -Force -ErrorAction SilentlyContinue 
                 Write-Host "Cleaned."
             }
@@ -515,19 +833,28 @@ function Invoke-CapsuleMode {
 # -------------------------------------------------------------------------
 
 function Select-VHDFile {
+    Show-Header "Browse VHDs"
     Write-Host "Scanning directory: $pwd" -ForegroundColor Gray
+    
     $files = Get-ChildItem -Path $pwd -File | Where-Object { $_.Extension -match "\.vhd(x)?$" }
+    
     if (-not $files) {
         Write-Host "No VHD/VHDX files found in current directory." -ForegroundColor Yellow
+        Read-Host "Press Enter"
         return $null
     }
     
-    Write-Host "Found VHDs:"
-    for ($i = 0; $i -lt $files.Count; $i++) {
-        Write-Host "$($i+1). $($files[$i].Name) ($([Math]::Round($files[$i].Length/1MB, 0)) MB)"
+    $ui = {
+        Show-Header "Browse VHDs"
+        Write-Host "Found $($files.Count) VHDs in $pwd`n"
+        for ($i = 0; $i -lt $files.Count; $i++) {
+            Write-Host "$($i+1). $($files[$i].Name) ($([Math]::Round($files[$i].Length/1MB, 0)) MB)"
+        }
+        Write-Host "`n0. Go back to main menu"
     }
     
-    $sel = Get-UserChoice "`nSelect Number" $files.Count
+    $sel = Get-UserChoice -Prompt "`nSelect Number" -Max $files.Count -UIBlock $ui
+    if ($sel -eq 0) { return $null }
     return $files[$sel - 1].FullName
 }
 
@@ -535,8 +862,12 @@ function Select-VHDFile {
 # 4. MAIN ENTRY POINT
 # -------------------------------------------------------------------------
 
+if ($SourceFolder) {
+    New-VHDCapsuleFromFolder -InputSource $SourceFolder -InputDest $DestinationPath -InputSize $SizeGB
+    exit
+}
 if ($Mode -eq "Capsule" -and $VHDPath) {
-    Invoke-CapsuleMode -Path $VHDPath -RelPath $GamePath
+    Invoke-CapsuleMode -Path $VHDPath -RelPath $AppPath
     exit
 }
 elseif ($Mode -eq "Manager" -and $VHDPath) {
@@ -546,36 +877,51 @@ elseif ($Mode -eq "Manager" -and $VHDPath) {
 
 # Interactive Menu Loop
 while ($true) {
-    Show-Header "Main Menu"
-    Write-Host "1. Create VHD (Initialize & Format)"
-    Write-Host "2. Browse VHD (Select from list)"
-    Write-Host "3. Manual Select VHD (Path input)"
-    Write-Host "4. Launch VHDX in Capsule Mode"
-    Write-Host "5. Exit"
+    $ui = {
+        Show-Header "Main Menu"
+        Write-Host "1. Create VHD (Initialize & Format)"
+        Write-Host "2. Create VHD Capsule from folder"
+        Write-Host "3. Browse VHD (Select from list)"
+        Write-Host "4. Manual Select VHD (Path input)"
+        Write-Host "5. Launch VHDX in Capsule Mode"
+        Write-Host "`n0. Exit"
+    }
     
-    $mainChoice = Get-UserChoice "`nSelect Option" 5
+    $mainChoice = Get-UserChoice -Prompt "`nSelect Option" -Max 5 -UIBlock $ui
     
     switch ($mainChoice) {
         1 { New-VHDItem }
-        2 { 
+        2 { New-VHDCapsuleFromFolder }
+        3 { 
             $p = Select-VHDFile
             if ($p) { Invoke-VHDManager -Path $p }
-            else { Read-Host "Press Enter" }
         }
-        3 {
-            $p = Read-Host "Enter full path to VHD/VHDX"
+        4 {
+            $p = Read-Host "Enter full path to VHD/VHDX (Press Enter to go back)"
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            
             $p = $p.Trim('"')
             if (Test-Path $p) { Invoke-VHDManager -Path $p }
             else { Write-Host "File not found." -ForegroundColor Red; Read-Host "Press Enter" }
         }
-        4 {
-            $p = Select-VHDFile
-            if (-not $p) {
-                $p = Read-Host "Enter full path to VHD/VHDX"
+        5 {
+            $filesCheck = Get-ChildItem -Path $pwd -File | Where-Object { $_.Extension -match "\.vhd(x)?$" }
+            
+            if ($filesCheck) {
+                # If files exist, browse them. If Select-VHDFile returns null (0), loop back (continue).
+                $p = Select-VHDFile
+                if (-not $p) { continue }
+            }
+            else {
+                # No files found, go straight to manual
+                Write-Host "No VHD/VHDX files found in current directory." -ForegroundColor Yellow
+                $p = Read-Host "Enter full path to VHD/VHDX (Press Enter to go back)"
+                if ([string]::IsNullOrWhiteSpace($p)) { continue }
                 $p = $p.Trim('"')
             }
+
             if ($p -and (Test-Path $p)) { Invoke-CapsuleMode -Path $p -RelPath $null }
         }
-        5 { exit }
+        0 { exit }
     }
 }
