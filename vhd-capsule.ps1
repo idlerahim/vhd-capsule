@@ -39,7 +39,10 @@ param(
     [string]$DestinationPath,
 
     [Parameter(Mandatory = $false)]
-    [string]$SizeGB
+    [string]$SizeGB,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$Force
 )
 
 # -------------------------------------------------------------------------
@@ -51,7 +54,7 @@ if ($InitialDir -and (Test-Path $InitialDir)) {
 }
 
 # Formatting for consistency
-$Host.UI.RawUI.WindowTitle = "VHD Manager & Capsule Launcher"
+$Host.UI.RawUI.WindowTitle = "VHD Capsule Manager"
 $ErrorActionPreference = "Stop"
 
 function Assert-Admin {
@@ -65,6 +68,7 @@ function Assert-Admin {
         if ($SourceFolder) { $params += " -SourceFolder `"$SourceFolder`"" }
         if ($DestinationPath) { $params += " -DestinationPath `"$DestinationPath`"" }
         if ($SizeGB) { $params += " -SizeGB $SizeGB" }
+        if ($Force) { $params += " -Force" }
         $params += " -InitialDir `"$($pwd.Path)`""
         
         Start-Process powershell.exe $params -Verb RunAs
@@ -479,7 +483,15 @@ function New-VHDCapsuleFromFolder {
         # We need to pass variables into the scriptblock scope if they aren't global. 
         # PowerShell closures capture variables, so this should work fine locally.
         
-        $choice = Get-UserChoice -Prompt "`nSelect Option (Default: 1)" -Max 3 -UIBlock $ui -Default 1
+        # PowerShell closures capture variables, so this should work fine locally.
+        
+        if ($Force) {
+            $choice = 1
+            Write-Host "Force mode enabled. Proceeding with default settings..." -ForegroundColor Yellow
+        }
+        else {
+            $choice = Get-UserChoice -Prompt "`nSelect Option (Default: 1)" -Max 3 -UIBlock $ui -Default 1
+        }
         
         if ($choice -eq 3) { return }
         if ($choice -eq 1) { break }
@@ -652,7 +664,7 @@ function Invoke-VHDManager {
             1 {
                 # Capsule Mode
                 $exitOps = $true
-                Invoke-CapsuleMode -Path $Path -RelPath $null
+                Invoke-CapsuleMode -Path $Path -AppPath $null
             }
             2 { 
                 if ($isMounted) {
@@ -724,7 +736,7 @@ detach vdisk
 }
 
 function Invoke-CapsuleMode {
-    param([string]$Path, [string]$RelPath)
+    param([string]$Path, [string]$AppPath)
     
     if (-not $Path) {
         $Path = Read-Host "Drag and drop VHD file here"
@@ -741,7 +753,7 @@ function Invoke-CapsuleMode {
     $drive = Mount-VHDNative -Path $Path
     if (-not $drive) { Write-Host "Failed to mount." -ForegroundColor Red; return }
     
-    if (-not $RelPath) {
+    if (-not $AppPath) {
         $defaultLnk = "launch_app.lnk"
         $isDefaultFound = Test-Path (Join-Path $drive $defaultLnk)
         $defaultMsg = "Enter Relative Path"
@@ -750,14 +762,14 @@ function Invoke-CapsuleMode {
         $inputPath = Read-Host $defaultMsg
         
         if ([string]::IsNullOrWhiteSpace($inputPath)) {
-            if ($isDefaultFound) { $RelPath = $defaultLnk }
+            if ($isDefaultFound) { $AppPath = $defaultLnk }
             else { 
                 Write-Host "No path provided." -ForegroundColor Red; 
                 Dismount-VHDNative -Path $Path; return 
             }
         }
         else {
-            $RelPath = $inputPath.Trim('"')
+            $AppPath = $inputPath.Trim('"')
         }
     }
     
@@ -766,9 +778,9 @@ function Invoke-CapsuleMode {
     $Before = Get-ChildItem -Path $drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
     
     # Step 3: Execution
-    $FullPath = Join-Path $drive $RelPath
+    $FullPath = Join-Path $drive $AppPath
     if (Test-Path $FullPath) {
-        Write-Host "[3/4] Launching $RelPath..." -ForegroundColor Green
+        Write-Host "[3/4] Launching $AppPath..." -ForegroundColor Green
         $proc = Start-Process -FilePath $FullPath -PassThru
         $proc.WaitForExit()
         Write-Host "Execution Finished." -ForegroundColor Yellow
@@ -867,7 +879,7 @@ if ($SourceFolder) {
     exit
 }
 if ($Mode -eq "Capsule" -and $VHDPath) {
-    Invoke-CapsuleMode -Path $VHDPath -RelPath $AppPath
+    Invoke-CapsuleMode -Path $VHDPath -AppPath $AppPath
     exit
 }
 elseif ($Mode -eq "Manager" -and $VHDPath) {
@@ -920,7 +932,7 @@ while ($true) {
                 $p = $p.Trim('"')
             }
 
-            if ($p -and (Test-Path $p)) { Invoke-CapsuleMode -Path $p -RelPath $null }
+            if ($p -and (Test-Path $p)) { Invoke-CapsuleMode -Path $p -AppPath $null }
         }
         0 { exit }
     }
