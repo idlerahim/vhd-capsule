@@ -128,10 +128,11 @@ function Get-VHDXPhysicalSize {
 }
 
 function Get-FreeDriveLetter {
-    $letters = 68..90 | ForEach-Object { [char]$_ + ":" } # D: to Z:
-    $used = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
-    foreach ($letter in $letters) {
-        if ($used -notcontains $letter[0]) { return $letter }
+    $used = (Get-PSDrive -PSProvider FileSystem).Name
+    foreach ($code in 68..90) {
+        # D to Z
+        $letter = [char]$code
+        if ($letter -notin $used) { return "${letter}:" }
     }
     throw "No free drive letters available."
 }
@@ -157,32 +158,36 @@ function Mount-VHDNative {
     
     Write-Host "Mounting $Path..." -ForegroundColor Yellow
     
-    # Try generic Mount-DiskImage
     try {
         $mount = Mount-DiskImage -ImagePath $Path -PassThru -ErrorAction Stop
         
-        # Wait for volume
+        # Wait for volume to become available
         Start-Sleep -Seconds 2
         
+        # Check if a drive letter was auto-assigned
         $volume = $mount | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
         if ($volume) {
             return "$($volume.DriveLetter):"
         }
         
-        # If no letter assigned, try to assign one via diskpart
+        # No letter auto-assigned — pick a free one and assign explicitly via diskpart
         Write-Host "No drive letter found. Attempting to assign..." -ForegroundColor Yellow
+        $freeLetter = Get-FreeDriveLetter
         $script = @"
 select vdisk file="$Path"
-attach vdisk
 select partition 1
-assign
+assign letter=$($freeLetter[0])
 "@
         Invoke-DiskPartScript -ScriptContent $script | Out-Null
         
-        # Check again
+        # Verify assignment
+        Start-Sleep -Seconds 1
         $mount = Get-DiskImage -ImagePath $Path
         $volume = $mount | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
         if ($volume) { return "$($volume.DriveLetter):" }
+        
+        # Fallback: return the letter we requested
+        if (Test-Path $freeLetter) { return $freeLetter }
     }
     catch {
         Write-Host "Mount failed: $($_.Exception.Message)" -ForegroundColor Red
@@ -417,7 +422,7 @@ function New-VHDCapsuleFromFolder {
     # 3. Size Calculation
     Show-Header "Create VHD Capsule from Folder: Step 3/4"
     Write-Host "Analyzing source folder..." -ForegroundColor Yellow
-    $stats = Get-ChildItem -Path $sourcePath -Recurse -Force | Measure-Object -Property Length -Sum
+    $stats = Get-ChildItem -Path $sourcePath -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
     $sourceSizeGB = [Math]::Round($stats.Sum / 1GB, 2)
     $minSizeGB = [Math]::Ceiling($sourceSizeGB + 2)
     $defaultSizeGB = [Math]::Ceiling($sourceSizeGB + 5)
@@ -480,9 +485,6 @@ function New-VHDCapsuleFromFolder {
             Write-Host "3. Cancel"
         }
         
-        # We need to pass variables into the scriptblock scope if they aren't global. 
-        # PowerShell closures capture variables, so this should work fine locally.
-        
         # PowerShell closures capture variables, so this should work fine locally.
         
         if ($Force) {
@@ -533,18 +535,7 @@ function New-VHDCapsuleFromFolder {
     Show-Header "Creating Capsule..."
     Write-Host "Creating VHD..." -ForegroundColor Yellow
     
-    $script = @"
-create vdisk file="$targetPath" maximum=$sizeMB type=$($config.Type)
-select vdisk file="$targetPath"
-attach vdisk
-convert $($config.PartStyle)
-create partition primary
-format fs=$($config.Fs) label="$($config.Label)" quick
-"@
-    # Add compression if needed (separate because format command is partially built)
-    # Actually simplest is to just append compress if needed, but 'format' is one line.
-    
-    # Rebuild script safely
+    # Build diskpart script with format options
     $fmtCmd = "format fs=$($config.Fs) label=`"$($config.Label)`" quick"
     if ($config.AllocUnit -ne "default") { $fmtCmd += " unit=$($config.AllocUnit)" }
     if ($config.Compress) { $fmtCmd += " compress" }
@@ -593,7 +584,7 @@ detach vdisk
         
         # 7. Final Report
         Write-Host "`nAnalysis & Verification..." -ForegroundColor Yellow
-        # Since we are mounted, we can measure destiny
+        # Since we are mounted, we can measure destination
         # Use SilentlyContinue to ignore 'System Volume Information' access denied errors
         $destStats = Get-ChildItem -Path $drive -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
         $destSizeGB = 0; if ($destStats.Sum) { $destSizeGB = [Math]::Round($destStats.Sum / 1GB, 4) }
@@ -687,10 +678,11 @@ function Invoke-VHDManager {
                     $stats = @{
                         PhysicalSize = "$(Get-VHDXPhysicalSize $Path) MB"
                         UsedSpace    = "$([Math]::Round(((Get-Volume -DriveLetter $drive[0]).SizeRemaining / 1GB), 2)) GB Free"
-                        FileCount    = (Get-ChildItem $drive -Recurse -File | Measure-Object).Count
+                        FileCount    = (Get-ChildItem $drive -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count
                     }
                     $stats | Format-Table -AutoSize
                     Optimize-Volume -DriveLetter $drive[0] -Analyze -Verbose
+                    Dismount-VHDNative -Path $Path
                     Read-Host "Press Enter"
                 }
             }
@@ -775,7 +767,7 @@ function Invoke-CapsuleMode {
     
     # Step 2: Snapshot
     Write-Host "[2/4] Taking filesystem snapshot..." -ForegroundColor Cyan
-    $Before = Get-ChildItem -Path $drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
+    $Before = Get-ChildItem -Path $drive -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName, LastWriteTime, Length
     
     # Step 3: Execution
     $FullPath = Join-Path $drive $AppPath
@@ -793,7 +785,7 @@ function Invoke-CapsuleMode {
     
     # Analysis
     Write-Host "Analyzing changes..." -ForegroundColor Cyan
-    $After = Get-ChildItem -Path $drive -Recurse -File | Select-Object FullName, LastWriteTime, Length
+    $After = Get-ChildItem -Path $drive -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName, LastWriteTime, Length
     $Diffs = Compare-Object -ReferenceObject $Before -DifferenceObject $After -Property FullName, LastWriteTime, Length -PassThru
     
     if ($Diffs) {
@@ -827,10 +819,22 @@ function Invoke-CapsuleMode {
                 Write-Host "Compacted." -ForegroundColor Green
                 $drive = Mount-VHDNative -Path $Path # Remount for continued maintenance if needed
             }
-            3 { Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose }
+            3 { 
+                if (-not $drive) { Write-Host "VHD is not mounted." -ForegroundColor Red }
+                else { Optimize-Volume -DriveLetter $drive[0] -Defrag -Verbose }
+            }
             4 { 
-                Remove-Item "$drive\`$RECYCLE.BIN" -Recurse -Force -ErrorAction SilentlyContinue 
-                Write-Host "Cleaned."
+                if (-not $drive) { Write-Host "VHD is not mounted." -ForegroundColor Red }
+                else {
+                    $junk = @("$drive\`$RECYCLE.BIN", "$drive\System Volume Information")
+                    foreach ($j in $junk) {
+                        if (Test-Path $j) {
+                            Remove-Item $j -Recurse -Force -ErrorAction SilentlyContinue
+                            Write-Host "Cleaned $j" -ForegroundColor Yellow
+                        }
+                    }
+                    Write-Host "Cleanup Done." -ForegroundColor Green
+                }
             }
         }
     }
