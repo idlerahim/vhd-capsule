@@ -53,8 +53,21 @@ if ($InitialDir -and (Test-Path $InitialDir)) {
     Set-Location $InitialDir
 }
 
+# Script Metadata
+$Script:Version = "v1.0.2.5"
+$Script:Description = @"
+Manages the lifecycle of Virtual Hard Disks (VHD/VHDX) and provides a specialized "Capsule Mode"
+for isolating applications with tracking of filesystem changes.
+
+Features:
+- Create VHD/VHDX (Fixed/Dynamic)
+- Browse and Select VHDs
+- Operations: Mount, Compact, Defrag, Clean Junk
+- Capsule Mode: Mount -> Snapshot -> Execute -> Diff -> Maintenance
+"@
+
 # Formatting for consistency
-$Host.UI.RawUI.WindowTitle = "VHD Capsule Manager"
+$Host.UI.RawUI.WindowTitle = "VHD Capsule Manager $Script:Version"
 $ErrorActionPreference = "Stop"
 
 function Assert-Admin {
@@ -85,13 +98,13 @@ function Show-Header {
     param([string]$Title)
     Clear-Host
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "   VHD CAPSULE: $Title" -ForegroundColor White
+    Write-Host "   VHD CAPSULE $Script:Version : $Title" -ForegroundColor White
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
 }
 
 function Get-UserChoice {
-    param([string]$Prompt, [int]$Max, [scriptblock]$UIBlock, [int]$Default = 0)
+    param([string]$Prompt, [int]$Max, [scriptblock]$UIBlock, [int]$Default = -1)
     
     # Initial Draw
     if ($UIBlock) { & $UIBlock }
@@ -99,7 +112,7 @@ function Get-UserChoice {
     while ($true) {
         $inputVal = Read-Host $Prompt
         
-        if ([string]::IsNullOrWhiteSpace($inputVal) -and $Default -gt 0) {
+        if ([string]::IsNullOrWhiteSpace($inputVal) -and $Default -ge 0) {
             return $Default
         }
 
@@ -158,6 +171,40 @@ function Mount-VHDNative {
     
     Write-Host "Mounting $Path..." -ForegroundColor Yellow
     
+    # Check if already mounted
+    try {
+        $existing = Get-DiskImage -ImagePath $Path -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Attached) {
+            Write-Host "VHD is already mounted." -ForegroundColor Yellow
+            $volume = $existing | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
+            if ($volume) {
+                return "$($volume.DriveLetter):"
+            }
+            
+            # Mounted but no letter — assign one
+            Write-Host "No drive letter found on mounted VHD. Assigning..." -ForegroundColor Yellow
+            $freeLetter = Get-FreeDriveLetter
+            $script = @"
+select vdisk file="$Path"
+select partition 1
+assign letter=$($freeLetter[0])
+"@
+            Invoke-DiskPartScript -ScriptContent $script | Out-Null
+            Start-Sleep -Seconds 1
+            $existing = Get-DiskImage -ImagePath $Path
+            $volume = $existing | Get-Disk | Get-Partition | Where-Object { $_.DriveLetter } | Select-Object -First 1
+            if ($volume) { return "$($volume.DriveLetter):" }
+            if (Test-Path $freeLetter) { return $freeLetter }
+        }
+    }
+    catch {
+        # Could not query disk image — file may be locked or inaccessible
+        Write-Host "Cannot access VHD: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "The file may be locked by another process (Disk Management, another VM, etc.)" -ForegroundColor Yellow
+        return $null
+    }
+    
+    # Not mounted — attach it
     try {
         $mount = Mount-DiskImage -ImagePath $Path -PassThru -ErrorAction Stop
         
@@ -190,7 +237,14 @@ assign letter=$($freeLetter[0])
         if (Test-Path $freeLetter) { return $freeLetter }
     }
     catch {
-        Write-Host "Mount failed: $($_.Exception.Message)" -ForegroundColor Red
+        $msg = $_.Exception.Message
+        if ($msg -match "locked|access|denied|use by another") {
+            Write-Host "VHD is locked or in use by another process." -ForegroundColor Red
+            Write-Host "Close Disk Management, Hyper-V, or any other tool that may have it open." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "Mount failed: $msg" -ForegroundColor Red
+        }
     }
     return $null
 }
@@ -728,7 +782,7 @@ detach vdisk
 }
 
 function Invoke-CapsuleMode {
-    param([string]$Path, [string]$AppPath)
+    param([string]$Path, [string]$AppPath, [switch]$DirectLaunch)
     
     if (-not $Path) {
         $Path = Read-Host "Drag and drop VHD file here"
@@ -743,7 +797,16 @@ function Invoke-CapsuleMode {
     # Step 1: Virtualization
     Write-Host "[1/4] Mounting..." -ForegroundColor Cyan
     $drive = Mount-VHDNative -Path $Path
-    if (-not $drive) { Write-Host "Failed to mount." -ForegroundColor Red; return }
+    if (-not $drive) { 
+        Write-Host "Failed to mount VHD. Cannot proceed." -ForegroundColor Red
+        if ($DirectLaunch) {
+            Read-Host "Press Enter to exit"
+            exit
+        }
+        Read-Host "Press Enter"
+        return
+    }
+    Write-Host "Drive: $drive" -ForegroundColor Green
     
     if (-not $AppPath) {
         $defaultLnk = "launch_app.lnk"
@@ -804,9 +867,15 @@ function Invoke-CapsuleMode {
         Write-Host "2. Compact"
         Write-Host "3. Defrag"
         Write-Host "4. Clean Junk"
-        Write-Host "`n0. Go back to main menu"
+        if ($DirectLaunch) {
+            Write-Host "`n0. Dismount and Exit [Default]"
+        }
+        else {
+            Write-Host "`n0. Go back to main menu"
+        }
     
-        $c = Get-UserChoice -Prompt "`nSelection" -Max 4 -UIBlock $null
+        $defaultMaint = if ($DirectLaunch) { 0 } else { -1 }
+        $c = Get-UserChoice -Prompt "`nSelection" -Max 4 -UIBlock $null -Default $defaultMaint
         switch ($c) {
             0 { $exitMaint = $true }
             1 { 
@@ -842,6 +911,7 @@ function Invoke-CapsuleMode {
     Dismount-VHDNative -Path $Path
     Write-Host "Capsule Closed." -ForegroundColor Green
     Start-Sleep 2
+    if ($DirectLaunch) { exit }
 }
 
 # -------------------------------------------------------------------------
@@ -883,12 +953,34 @@ if ($SourceFolder) {
     exit
 }
 if ($Mode -eq "Capsule" -and $VHDPath) {
-    Invoke-CapsuleMode -Path $VHDPath -AppPath $AppPath
+    Invoke-CapsuleMode -Path $VHDPath -AppPath $AppPath -DirectLaunch
     exit
 }
 elseif ($Mode -eq "Manager" -and $VHDPath) {
     Invoke-VHDManager -Path $VHDPath
     exit
+}
+
+# Companion Mode: If script is renamed from default and no arguments given,
+# look for a matching VHD/VHDX beside the script and auto-launch Capsule Mode.
+$defaultScriptName = "vhd-capsule"
+$currentScriptName = [System.IO.Path]::GetFileNameWithoutExtension($PSCommandPath)
+$scriptDir = Split-Path $PSCommandPath -Parent
+
+if ($currentScriptName -ne $defaultScriptName -and -not $VHDPath -and -not $SourceFolder -and $Mode -eq "Menu") {
+    # Try .vhdx first, then .vhd
+    $companionVhdx = Join-Path $scriptDir "$currentScriptName.vhdx"
+    $companionVhd = Join-Path $scriptDir "$currentScriptName.vhd"
+    
+    $companionPath = $null
+    if (Test-Path $companionVhdx) { $companionPath = $companionVhdx }
+    elseif (Test-Path $companionVhd) { $companionPath = $companionVhd }
+    
+    if ($companionPath) {
+        Write-Host "[Companion Mode] Found $(Split-Path $companionPath -Leaf)" -ForegroundColor Cyan
+        Invoke-CapsuleMode -Path $companionPath -AppPath "launch_app.lnk" -DirectLaunch
+        exit
+    }
 }
 
 # Interactive Menu Loop
@@ -900,10 +992,11 @@ while ($true) {
         Write-Host "3. Browse VHD (Select from list)"
         Write-Host "4. Manual Select VHD (Path input)"
         Write-Host "5. Launch VHDX in Capsule Mode"
+        Write-Host "6. Info"
         Write-Host "`n0. Exit"
     }
     
-    $mainChoice = Get-UserChoice -Prompt "`nSelect Option" -Max 5 -UIBlock $ui
+    $mainChoice = Get-UserChoice -Prompt "`nSelect Option" -Max 6 -UIBlock $ui
     
     switch ($mainChoice) {
         1 { New-VHDItem }
@@ -937,6 +1030,16 @@ while ($true) {
             }
 
             if ($p -and (Test-Path $p)) { Invoke-CapsuleMode -Path $p -AppPath $null }
+        }
+        6 {
+            Show-Header "Info"
+            Write-Host "Version" -ForegroundColor Cyan
+            Write-Host "  $Script:Version"
+            Write-Host ""
+            Write-Host "Description" -ForegroundColor Cyan
+            Write-Host "  $Script:Description"
+            Write-Host ""
+            Read-Host "Press Enter to return to menu"
         }
         0 { exit }
     }

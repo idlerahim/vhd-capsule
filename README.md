@@ -1,5 +1,7 @@
 # VHD Capsule
 
+**Version: v1.0.2.5**
+
 A PowerShell-based VHD/VHDX manager with a specialized **Capsule Mode** that isolates applications inside virtual hard disks, tracks every filesystem change they make, and provides post-execution maintenance — all from a single script with no dependencies.
 
 ---
@@ -88,12 +90,14 @@ No Hyper-V role installation is required — the script uses native `diskpart` a
 | **Create VHD/VHDX** | Step-by-step wizard: format, filename, size, type (dynamic/fixed), partition style (GPT/MBR), filesystem (NTFS/FAT32), allocation unit, compression, volume label |
 | **Create Capsule from Folder** | Convert any folder into a self-contained VHDX with automatic size calculation and Robocopy-based transfer |
 | **Browse & Select** | Scan the current directory for VHD/VHDX files and pick one from a numbered list |
-| **Mount / Dismount** | Robust mounting with automatic drive letter assignment and diskpart fallback |
+| **Mount / Dismount** | Robust mounting with automatic drive letter assignment, diskpart fallback, and already-mounted VHD detection |
 | **Capsule Mode** | Mount → Snapshot → Execute → Diff → Maintenance lifecycle |
+| **Companion Mode** | Rename the script to match a VHD filename and double-click to auto-launch Capsule Mode |
 | **Compact** | Shrink dynamic VHD files by reclaiming unused space |
 | **Defragment** | Optimize the filesystem inside the VHD |
 | **Clean Junk** | Remove `$RECYCLE.BIN` and `System Volume Information` from inside the VHD |
 | **Current State** | Display physical size, free space, file count, and fragmentation analysis |
+| **Info** | Display script version and description from the main menu |
 
 ---
 
@@ -111,7 +115,7 @@ This presents the main menu:
 
 ```
 ========================================
-   VHD CAPSULE: Main Menu
+   VHD CAPSULE v1.0.2.5 : Main Menu
 ========================================
 
 1. Create VHD (Initialize & Format)
@@ -119,6 +123,7 @@ This presents the main menu:
 3. Browse VHD (Select from list)
 4. Manual Select VHD (Path input)
 5. Launch VHDX in Capsule Mode
+6. Info
 
 0. Exit
 ```
@@ -146,6 +151,7 @@ Launch an application inside a VHD capsule and track filesystem changes:
 ```
 [1/4] Mounting...
 Mounting C:\Capsules\MyApp.vhdx...
+Drive: E:
 
 [2/4] Taking filesystem snapshot...
 
@@ -167,10 +173,14 @@ E:\Logs\session.log               2/19/2026 10:30:15 PM   4096 =>
 3. Defrag
 4. Clean Junk
 
-0. Go back to main menu
+0. Dismount and Exit [Default]
 ```
 
 The diff table uses `=>` for new/modified files and `<=` for deleted files.
+
+> **Note:** When Capsule Mode is launched via command-line arguments or Companion Mode ("Direct Launch"), option 0 reads **"Dismount and Exit"** and pressing Enter defaults to it. When launched from the interactive menu, it reads **"Go back to main menu"** instead.
+
+If the VHD is already mounted when Capsule Mode starts, the script **detects the existing mount** and reuses the drive letter instead of failing.
 
 ---
 
@@ -216,6 +226,52 @@ Convert an existing application folder into a self-contained VHDX capsule:
 - **Minimum:** Source size + 2 GB (headroom for filesystem overhead).
 - **Default:** Source size + 5 GB (comfortable working space).
 - The script enforces the minimum and warns if a manually entered size is too small.
+
+---
+
+## Companion Mode
+
+Companion Mode provides the simplest possible way to launch a capsule — just **rename the script** to match your VHD file and double-click it.
+
+### How It Works
+
+1. Copy `vhd-capsule.ps1` next to your VHD file.
+2. Rename the copy to match the VHD filename (e.g., `MyApp.ps1` for `MyApp.vhdx`).
+3. Double-click the renamed script — it auto-detects the matching VHD and launches Capsule Mode.
+
+```
+D:\Capsules\
+├── MyApp.ps1       ← renamed copy of vhd-capsule.ps1
+├── MyApp.vhdx      ← companion VHD (auto-detected)
+└── AnotherApp.ps1  ← another renamed copy
+└── AnotherApp.vhd  ← works with .vhd too
+```
+
+### Detection Logic
+
+- The script checks its own filename (e.g., `MyApp.ps1` → `MyApp`).
+- If the name is **not** `vhd-capsule` (the default) and **no arguments** were passed:
+  - It looks for `MyApp.vhdx` in the same directory.
+  - Falls back to `MyApp.vhd` if no `.vhdx` is found.
+  - If a match is found, launches Capsule Mode with `launch_app.lnk` as the default app path.
+- If no matching VHD exists, the normal interactive menu is shown.
+
+### Setting Up a Companion Capsule
+
+```powershell
+# 1. Create the capsule from a folder
+.\vhd-capsule.ps1 -SourceFolder "C:\Apps\MyApp" -DestinationPath "D:\Capsules" -Force
+
+# 2. Copy the script next to it and rename
+Copy-Item .\vhd-capsule.ps1 "D:\Capsules\MyApp.ps1"
+
+# 3. Make sure launch_app.lnk exists in the VHD root
+# (Create a shortcut to the main executable inside the VHD)
+
+# 4. Double-click MyApp.ps1 — done!
+```
+
+This makes each capsule fully self-contained: one `.ps1` + one `.vhdx`, no arguments needed.
 
 ---
 
@@ -364,13 +420,21 @@ When creating a VHD through the interactive wizard (`New-VHDItem`), you control 
 ### Script requires Administrator
 The script auto-detects if it's running without admin rights and relaunches itself elevated via UAC. All parameters are preserved during re-elevation.
 
+### VHD is already mounted
+The script **automatically detects** if the VHD is already attached and reuses the existing drive letter. If the VHD is mounted but has no drive letter assigned, it will assign one via diskpart. No manual intervention needed.
+
 ### No drive letter after mounting
 The script uses a two-stage mount approach:
 1. First, it tries `Mount-DiskImage` and checks for an auto-assigned letter.
 2. If no letter is assigned, it picks a free drive letter and assigns it explicitly via `diskpart`.
 
 ### VHD file is locked / cannot be accessed
-Make sure the VHD is not mounted elsewhere or opened in Disk Management. Use `Dismount-DiskImage -ImagePath "path"` to force-release it.
+The script detects locked or inaccessible VHDs and shows a clear error message with guidance. Common causes:
+- Disk Management has the VHD open
+- Hyper-V is using the VHD
+- Another instance of the script is operating on the same file
+
+Fix: Close any tools that have the VHD open, or use `Dismount-DiskImage -ImagePath "path"` to force-release it.
 
 ### Robocopy exits with code 1–7
 Robocopy exit codes 1–7 are **not errors**. They indicate various "success with details" statuses (e.g., files were copied, extra files found). Only codes ≥ 8 indicate actual failures.
