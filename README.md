@@ -1,6 +1,10 @@
 # VHD Capsule
 
-**Version: v1.0.2.5**
+![Version](https://img.shields.io/badge/version-1.0.2.5-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-5391FE.svg?logo=powershell&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4.svg?logo=windows&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
 A PowerShell-based VHD/VHDX manager with a specialized **Capsule Mode** that isolates applications inside virtual hard disks, tracks every filesystem change they make, and provides post-execution maintenance — all from a single script with no dependencies.
 
