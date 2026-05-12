@@ -22,22 +22,7 @@ Beyond capsule isolation, the script is also a full-featured VHD lifecycle manag
 
 ### How It Works
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    VHD CAPSULE FLOW                      │
-│                                                         │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐            │
-│  │  Mount   │──▶│ Snapshot │──▶│ Execute  │            │
-│  │  VHDX    │   │ (Before) │   │   App    │            │
-│  └──────────┘   └──────────┘   └──────────┘            │
-│                                      │                  │
-│                                      ▼                  │
-│  ┌──────────┐   ┌──────────┐   ┌──────────┐            │
-│  │ Dismount │◀──│  Maint.  │◀──│   Diff   │            │
-│  │  VHDX    │   │   Menu   │   │ (After)  │            │
-│  └──────────┘   └──────────┘   └──────────┘            │
-└─────────────────────────────────────────────────────────┘
-```
+![Architecture Flow](docs/architecture_flow.png)
 
 1. **Mount**: The VHD/VHDX is attached and assigned a drive letter dynamically.
 2. **Snapshot**: A full recursive file listing is captured (path, timestamp, size).
